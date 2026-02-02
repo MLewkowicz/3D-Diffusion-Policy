@@ -1,0 +1,38 @@
+name: calvin
+
+task_name: calvin
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    point_cloud:
+      shape: [2048, 3]
+      type: point_cloud
+    agent_pos:
+      shape: [15]
+      type: low_dim
+  action:
+    shape: [7]
+
+# Set env_runner to null if you only want to train on data without evaluation
+# Or provide a dataset_path to use the CALVIN simulation environment
+env_runner: null
+# env_runner:
+#   _target_: diffusion_policy_3d.env_runner.calvin_runner.CalvinRunner
+#   n_train: 20
+#   max_steps: 250
+#   n_obs_steps: ${n_obs_steps}
+#   n_action_steps: ${n_action_steps}
+#   fps: 10
+#   dataset_path: null  # Path to CALVIN dataset if using simulation
+#   split: validation
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.calvin_dataset.CalvinDataset
+  zarr_path: data/calvin_dp3.zarr  # Update this path to your converted Zarr file
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null  # Set to limit training episodes, or null to use all
