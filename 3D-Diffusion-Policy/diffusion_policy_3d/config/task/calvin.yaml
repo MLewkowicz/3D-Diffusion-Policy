@@ -29,7 +29,7 @@ env_runner: null
 
 dataset:
   _target_: diffusion_policy_3d.dataset.calvin_dataset.CalvinDataset
-  zarr_path: data/calvin_dp3.zarr  # Update this path to your converted Zarr file
+  zarr_path: /home/mlewkowicz/3D-Diffusion-Policy/data/calvin_debug_dp3.zarr
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}

@@ -4,7 +4,14 @@ import pickle
 import tqdm
 import numpy as np
 import torch
-import pytorch3d.ops as torch3d_ops
+# Use pure PyTorch FPS instead of pytorch3d
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '3D-Diffusion-Policy'))
+from diffusion_policy_3d.utils.fps_ops import sample_farthest_points as torch3d_ops_sample_farthest_points
+class MockOps:
+    sample_farthest_points = staticmethod(torch3d_ops_sample_farthest_points)
+torch3d_ops = MockOps()
 import torchvision
 from termcolor import cprint
 import re
@@ -13,7 +20,14 @@ import time
 
 import numpy as np
 import torch
-import pytorch3d.ops as torch3d_ops
+# Use pure PyTorch FPS instead of pytorch3d
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '3D-Diffusion-Policy'))
+from diffusion_policy_3d.utils.fps_ops import sample_farthest_points as torch3d_ops_sample_farthest_points
+class MockOps:
+    sample_farthest_points = staticmethod(torch3d_ops_sample_farthest_points)
+torch3d_ops = MockOps()
 import torchvision
 import socket
 import pickle
@@ -27,11 +41,13 @@ def farthest_point_sampling(points, num_points=1024, use_cuda=True):
         sampled_points, indices = torch3d_ops.sample_farthest_points(points=points.unsqueeze(0), K=K)
         sampled_points = sampled_points.squeeze(0)
         sampled_points = sampled_points.cpu().numpy()
+        indices = indices.squeeze(0).cpu()
     else:
         points = torch.from_numpy(points)
         sampled_points, indices = torch3d_ops.sample_farthest_points(points=points.unsqueeze(0), K=K)
         sampled_points = sampled_points.squeeze(0)
         sampled_points = sampled_points.numpy()
+        indices = indices.squeeze(0)
 
     return sampled_points, indices
 

@@ -1,7 +1,11 @@
 import gym
 import numpy as np
 import torch
-import pytorch3d.ops as torch3d_ops
+from diffusion_policy_3d.utils.fps_ops import sample_farthest_points as torch3d_ops_sample_farthest_points
+# Create a mock module for compatibility
+class MockOps:
+    sample_farthest_points = staticmethod(torch3d_ops_sample_farthest_points)
+torch3d_ops = MockOps()
 
 from termcolor import cprint
 from dexart.env.task_setting import TRAIN_CONFIG, RANDOM_CONFIG

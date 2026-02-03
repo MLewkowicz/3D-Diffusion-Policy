@@ -8,7 +8,11 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from termcolor import cprint
 import copy
 import time
-import pytorch3d.ops as torch3d_ops
+from diffusion_policy_3d.utils.fps_ops import sample_farthest_points as torch3d_ops_sample_farthest_points
+# Create a mock module for compatibility
+class MockOps:
+    sample_farthest_points = staticmethod(torch3d_ops_sample_farthest_points)
+torch3d_ops = MockOps()
 
 from diffusion_policy_3d.model.common.normalizer import LinearNormalizer
 from diffusion_policy_3d.policy.base_policy import BasePolicy

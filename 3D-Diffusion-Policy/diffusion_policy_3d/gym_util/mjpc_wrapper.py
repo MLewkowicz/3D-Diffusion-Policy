@@ -1,6 +1,10 @@
 import gym
 import numpy as np
-import pytorch3d.ops as torch3d_ops
+from diffusion_policy_3d.utils.fps_ops import sample_farthest_points as torch3d_ops_sample_farthest_points
+# Create a mock module for compatibility
+class MockOps:
+    sample_farthest_points = staticmethod(torch3d_ops_sample_farthest_points)
+torch3d_ops = MockOps()
 import torch
 import os
 
