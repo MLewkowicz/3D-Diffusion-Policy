@@ -2,10 +2,14 @@
 #SBATCH --job-name=calvin_viz
 #SBATCH --output=logs/calvin_mode_visualizer_%j.out
 #SBATCH --error=logs/calvin_mode_visualizer_%j.err
+#SBATCH --partition=clear-l40s
+#SBATCH --account=clear
+#SBATCH --qos=clear-main
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
 #SBATCH --time=01:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
-#SBATCH --partition=standard
 
 source /data/scratch/aryannav/.miniforge3/bin/activate base
 
