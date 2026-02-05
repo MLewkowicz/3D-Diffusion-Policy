@@ -13,11 +13,19 @@ Supports:
 """
 
 import os
+import sys
 import argparse
+import time
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
 from termcolor import cprint
+
+
+def _log(msg: str, verbose: bool = False):
+    """Print and flush so SLURM logs show output immediately."""
+    if verbose:
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # Optional: zarr for converted dataset
 try:
@@ -35,7 +43,7 @@ except ImportError:
     HAS_PLOTLY = False
 
 
-def load_trajectories_from_calvin_root(root_dir: str, split: str = "training"):
+def load_trajectories_from_calvin_root(root_dir: str, split: str = "training", verbose: bool = False):
     """
     Load EE (end-effector) trajectories from raw CALVIN dataset by task.
 
@@ -51,18 +59,32 @@ def load_trajectories_from_calvin_root(root_dir: str, split: str = "training"):
     if not ann_path.exists():
         raise FileNotFoundError(f"Annotations not found: {ann_path}")
 
+    _log("Loading annotations...", verbose)
+    t0 = time.perf_counter()
     annotations = np.load(ann_path, allow_pickle=True).item()
     indx = annotations["info"]["indx"]  # list of (start_id, end_id)
     tasks = annotations["language"]["task"]  # list of task names
+    n_trajectories = len(indx)
+    _log(f"Found {n_trajectories} trajectories, {len(set(tasks))} unique tasks. Loading episodes...", verbose)
 
     trajectories_by_task = defaultdict(list)
+    total_eps = 0
+    last_log = 0
+    log_every = max(1, n_trajectories // 20)  # log ~20 times over the run
 
     for i, ((start_id, end_id), task_name) in enumerate(zip(indx, tasks)):
+        if verbose and (i - last_log >= log_every or i == 0 or i == n_trajectories - 1):
+            _log(f"Trajectory {i+1}/{n_trajectories} (task={task_name}, eps {start_id}-{end_id})...", verbose)
+            last_log = i
         trajectory_frames = []
         for ep_id in range(start_id, end_id + 1):
+            total_eps += 1
+            if verbose and total_eps % 500 == 0:
+                _log(f"  Loaded {total_eps} episode files so far...", verbose)
             ep_path = root_dir / split / f"episode_{ep_id:07d}.npz"
             if not ep_path.exists():
-                cprint(f"Missing episode: {ep_path}", "yellow")
+                if verbose:
+                    _log(f"Missing episode: {ep_path}", verbose)
                 continue
             data = np.load(ep_path)
             robot_obs = data["robot_obs"]  # (T, 15) or (15,) for single timestep
@@ -73,13 +95,14 @@ def load_trajectories_from_calvin_root(root_dir: str, split: str = "training"):
         if trajectory_frames:
             traj = np.concatenate(trajectory_frames, axis=0)
             trajectories_by_task[task_name].append(traj)
-        else:
-            cprint(f"Empty trajectory for task '{task_name}' (start={start_id}, end={end_id})", "yellow")
+        elif verbose:
+            _log(f"Empty trajectory for task '{task_name}' (start={start_id}, end={end_id})", verbose)
 
+    _log(f"Load done in {time.perf_counter() - t0:.1f}s ({total_eps} episode files).", verbose)
     return dict(trajectories_by_task)
 
 
-def load_trajectories_from_zarr(zarr_path: str):
+def load_trajectories_from_zarr(zarr_path: str, verbose: bool = False):
     """
     Load EE trajectories from converted DP3 zarr (by episode).
 
@@ -89,12 +112,15 @@ def load_trajectories_from_zarr(zarr_path: str):
     if not HAS_ZARR:
         raise ImportError("zarr is required for zarr_path. pip install zarr")
 
+    _log("Opening zarr...", verbose)
+    t0 = time.perf_counter()
     root = zarr.open(zarr_path, mode="r")
     data = root["data"]
     meta = root["meta"]
-    state = data["state"]  # (N, 15) or similar
     episode_ends = meta["episode_ends"][:]
+    _log(f"Zarr open: {len(episode_ends)} episodes. Reading state...", verbose)
 
+    state = data["state"]  # (N, 15) or similar
     trajectories = []
     start = 0
     for end in episode_ends:
@@ -103,6 +129,7 @@ def load_trajectories_from_zarr(zarr_path: str):
             trajectories.append(ee)
         start = end
 
+    _log(f"Zarr load done in {time.perf_counter() - t0:.1f}s.", verbose)
     return {"episode": trajectories}
 
 
@@ -162,6 +189,7 @@ def save_trajectory_plots(
     one_per_task: bool = True,
     combined: bool = True,
     max_trajectories_per_task=None,
+    verbose: bool = False,
 ):
     """
     Save interactive HTML plots (Plotly) for trajectory inspection.
@@ -172,6 +200,8 @@ def save_trajectory_plots(
     if not HAS_PLOTLY:
         raise ImportError("plotly is required. pip install plotly")
 
+    _log("Creating output directory and building plots...", verbose)
+    t0 = time.perf_counter()
     os.makedirs(output_dir, exist_ok=True)
 
     # Sanitize filenames for task names
@@ -179,9 +209,11 @@ def save_trajectory_plots(
         return "".join(c if c.isalnum() or c in "_-" else "_" for c in name).strip("_") or "task"
 
     if one_per_task:
-        for task_name, trajs in trajectories_by_task.items():
-            if not trajs:
-                continue
+        task_list = [t for t, trajs in trajectories_by_task.items() if trajs]
+        for ki, task_name in enumerate(task_list):
+            trajs = trajectories_by_task[task_name]
+            if verbose:
+                _log(f"Plotting task {ki+1}/{len(task_list)}: {task_name} ({len(trajs)} trajectories)...", verbose)
             fig = _plotly_trajectories_to_figure(
                 {task_name: trajs},
                 title=f"Task: {task_name} ({len(trajs)} trajectories)",
@@ -189,9 +221,12 @@ def save_trajectory_plots(
             )
             path = os.path.join(output_dir, f"{safe_name(task_name)}.html")
             fig.write_html(path)
+            if verbose:
+                _log(f"  Wrote {path}", verbose)
             cprint(f"Saved: {path}", "green")
 
     if combined and len(trajectories_by_task) > 0:
+        _log("Building combined all_tasks.html...", verbose)
         fig = _plotly_trajectories_to_figure(
             trajectories_by_task,
             title="CALVIN trajectories (all tasks)",
@@ -200,6 +235,7 @@ def save_trajectory_plots(
         path = os.path.join(output_dir, "all_tasks.html")
         fig.write_html(path)
         cprint(f"Saved: {path}", "green")
+    _log(f"All plots saved in {time.perf_counter() - t0:.1f}s.", verbose)
 
 
 def main():
@@ -241,8 +277,16 @@ def main():
         default=None,
         help="Max trajectories per task to plot (default: all)",
     )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Print progress with timestamps (flushed so SLURM logs show where time is spent)",
+    )
     args = parser.parse_args()
 
+    verbose = args.verbose
+    _log("Starting calvin_mode_visualizer.", verbose)
     input_path = Path(args.input_path)
     if not input_path.exists():
         cprint(f"Path does not exist: {input_path}", "red")
@@ -262,11 +306,13 @@ def main():
 
     if is_zarr:
         cprint("Loading trajectories from converted zarr...", "cyan")
-        trajectories_by_task = load_trajectories_from_zarr(str(input_path))
+        trajectories_by_task = load_trajectories_from_zarr(str(input_path), verbose=verbose)
         cprint(f"Loaded {sum(len(t) for t in trajectories_by_task.values())} episodes.", "green")
     else:
         cprint(f"Loading trajectories from raw CALVIN root (split={args.split})...", "cyan")
-        trajectories_by_task = load_trajectories_from_calvin_root(str(input_path), split=args.split)
+        trajectories_by_task = load_trajectories_from_calvin_root(
+            str(input_path), split=args.split, verbose=verbose
+        )
         total = sum(len(t) for t in trajectories_by_task.values())
         cprint(f"Loaded {total} trajectories across {len(trajectories_by_task)} tasks.", "green")
 
@@ -284,6 +330,7 @@ def main():
         one_per_task=not args.no_per_task,
         combined=not args.no_combined,
         max_trajectories_per_task=args.max_trajectories,
+        verbose=verbose,
     )
     cprint("Done. Open the HTML files in a browser to rotate/zoom the 3D scene.", "green")
 
