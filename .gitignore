@@ -33,7 +33,8 @@ test.gif
 test.mp4
 test_depth.mp4
 test.png
-
+# data related
+*.tar.gz
 debug.png
 debug.mp4
 debug.gif

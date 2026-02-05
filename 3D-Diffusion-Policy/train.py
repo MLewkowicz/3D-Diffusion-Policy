@@ -14,6 +14,8 @@ import dill
 from omegaconf import OmegaConf
 import pathlib
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 import copy
 import random
 import wandb
@@ -33,6 +35,43 @@ from diffusion_policy_3d.model.diffusion.ema_model import EMAModel
 from diffusion_policy_3d.model.common.lr_scheduler import get_scheduler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+
+def _is_ddp() -> bool:
+    """True when launched with torchrun (RANK is set)."""
+    return "RANK" in os.environ and os.environ.get("RANK", "").strip() != ""
+
+
+def _ddp_rank() -> int:
+    return int(os.environ["RANK"])
+
+
+def _ddp_local_rank() -> int:
+    return int(os.environ["LOCAL_RANK"])
+
+
+def _ddp_world_size() -> int:
+    return int(os.environ["WORLD_SIZE"])
+
+
+def _is_main_process() -> bool:
+    return not _is_ddp() or _ddp_rank() == 0
+
+
+def _get_state_dict_for_save(module):
+    """Return state_dict of the underlying module (strip DDP wrapper for saving)."""
+    return getattr(module, "module", module).state_dict()
+
+
+def _get_module_for_load(module):
+    """Return the module to load state_dict into (works with or without DDP wrapper)."""
+    return getattr(module, "module", module)
+
+
+def _copy_to_cpu(state_dict):
+    """Copy state dict tensors to CPU for thread-safe saving."""
+    return {k: v.cpu().clone() if isinstance(v, torch.Tensor) else v for k, v in state_dict.items()}
+
 
 class TrainDP3Workspace:
     include_keys = ['global_step', 'epoch']
@@ -70,6 +109,17 @@ class TrainDP3Workspace:
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
+        use_ddp = _is_ddp()
+        if use_ddp:
+            dist.init_process_group(backend="nccl")
+            local_rank = _ddp_local_rank()
+            world_size = _ddp_world_size()
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
+            if _is_main_process():
+                cprint(f"DDP: world_size={world_size}", "yellow")
+        else:
+            device = torch.device(cfg.training.device)
         
         if cfg.training.debug:
             cfg.training.num_epochs = 100
@@ -93,7 +143,8 @@ class TrainDP3Workspace:
         if cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
             if lastest_ckpt_path.is_file():
-                print(f"Resuming from checkpoint {lastest_ckpt_path}")
+                if _is_main_process():
+                    print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
 
         # configure dataset
@@ -101,12 +152,36 @@ class TrainDP3Workspace:
         dataset = hydra.utils.instantiate(cfg.task.dataset)
 
         assert isinstance(dataset, BaseDataset), print(f"dataset must be BaseDataset, got {type(dataset)}")
-        train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        if use_ddp:
+            train_sampler = DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=_ddp_rank(),
+                shuffle=cfg.dataloader.get("shuffle", True),
+            )
+            train_dataloader_kwargs = dict(cfg.dataloader)
+            train_dataloader_kwargs["sampler"] = train_sampler
+            train_dataloader_kwargs["shuffle"] = False
+            train_dataloader = DataLoader(dataset, **train_dataloader_kwargs)
+        else:
+            train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
-        val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
+        if use_ddp:
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=world_size,
+                rank=_ddp_rank(),
+                shuffle=False,
+            )
+            val_dataloader_kwargs = dict(cfg.val_dataloader)
+            val_dataloader_kwargs["sampler"] = val_sampler
+            val_dataloader_kwargs["shuffle"] = False
+            val_dataloader = DataLoader(val_dataset, **val_dataloader_kwargs)
+        else:
+            val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
 
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
@@ -142,21 +217,24 @@ class TrainDP3Workspace:
             assert isinstance(env_runner, BaseRunner)
         
         cfg.logging.name = str(cfg.logging.name)
-        cprint("-----------------------------", "yellow")
-        cprint(f"[WandB] group: {cfg.logging.group}", "yellow")
-        cprint(f"[WandB] name: {cfg.logging.name}", "yellow")
-        cprint("-----------------------------", "yellow")
-        # configure logging
-        wandb_run = wandb.init(
-            dir=str(self.output_dir),
-            config=OmegaConf.to_container(cfg, resolve=True),
-            **cfg.logging
-        )
-        wandb.config.update(
-            {
-                "output_dir": self.output_dir,
-            }
-        )
+        if _is_main_process():
+            cprint("-----------------------------", "yellow")
+            cprint(f"[WandB] group: {cfg.logging.group}", "yellow")
+            cprint(f"[WandB] name: {cfg.logging.name}", "yellow")
+            cprint("-----------------------------", "yellow")
+        # configure logging (only rank 0 in DDP)
+        wandb_run = None
+        if _is_main_process():
+            wandb_run = wandb.init(
+                dir=str(self.output_dir),
+                config=OmegaConf.to_container(cfg, resolve=True),
+                **cfg.logging
+            )
+            wandb.config.update(
+                {
+                    "output_dir": self.output_dir,
+                }
+            )
 
         # configure checkpoint
         topk_manager = TopKCheckpointManager(
@@ -164,12 +242,15 @@ class TrainDP3Workspace:
             **cfg.checkpoint.topk
         )
 
-        # device transfer
-        device = torch.device(cfg.training.device)
+        # device transfer (device already set above when use_ddp)
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
+        if use_ddp:
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                self.model, device_ids=[local_rank], output_device=local_rank
+            )
 
         # save batch for sampling
         train_sampling_batch = None
@@ -178,11 +259,18 @@ class TrainDP3Workspace:
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         for local_epoch_idx in range(cfg.training.num_epochs):
+            if use_ddp:
+                train_sampler.set_epoch(self.epoch)
             step_log = dict()
             # ========= train for this epoch ==========
             train_losses = list()
-            with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
-                    leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
+            with tqdm.tqdm(
+                train_dataloader,
+                desc=f"Training epoch {self.epoch}",
+                leave=False,
+                mininterval=cfg.training.tqdm_interval_sec,
+                disable=not _is_main_process(),
+            ) as tepoch:
                 for batch_idx, batch in enumerate(tepoch):
                     t1 = time.time()
                     # device transfer
@@ -204,9 +292,9 @@ class TrainDP3Workspace:
                         self.optimizer.zero_grad()
                         lr_scheduler.step()
                     t1_3 = time.time()
-                    # update ema
+                    # update ema (use unwrapped model when DDP)
                     if cfg.training.use_ema:
-                        ema.step(self.model)
+                        ema.step(_get_module_for_load(self.model))
                     t1_4 = time.time()
                     # logging
                     raw_loss_cpu = raw_loss.item()
@@ -232,7 +320,8 @@ class TrainDP3Workspace:
                     is_last_batch = (batch_idx == (len(train_dataloader)-1))
                     if not is_last_batch:
                         # log of last step is combined with validation and rollout
-                        wandb_run.log(step_log, step=self.global_step)
+                        if _is_main_process() and wandb_run is not None:
+                            wandb_run.log(step_log, step=self.global_step)
                         self.global_step += 1
 
                     if (cfg.training.max_train_steps is not None) \
@@ -245,25 +334,34 @@ class TrainDP3Workspace:
             step_log['train_loss'] = train_loss
 
             # ========= eval for this epoch ==========
-            policy = self.model
+            policy = _get_module_for_load(self.model)
             if cfg.training.use_ema:
                 policy = self.ema_model
             policy.eval()
 
-            # run rollout
-            if (self.epoch % cfg.training.rollout_every) == 0 and RUN_ROLLOUT and env_runner is not None:
-                t3 = time.time()
-                # runner_log = env_runner.run(policy, dataset=dataset)
-                runner_log = env_runner.run(policy)
-                t4 = time.time()
-                # print(f"rollout time: {t4-t3:.3f}")
-                # log all
-                step_log.update(runner_log)
-
-            
+            # run rollout (only rank 0; env evaluation is not distributed)
+            if (
+                _is_main_process()
+                and (self.epoch % cfg.training.rollout_every) == 0
+                and RUN_ROLLOUT
+                and env_runner is not None
+            ):
+                torch.cuda.empty_cache() 
                 
-            # run validation
-            if (self.epoch % cfg.training.val_every) == 0 and RUN_VALIDATION:
+                with torch.no_grad(): 
+                    t3 = time.time()
+                    runner_log = env_runner.run(policy)
+                    t4 = time.time()
+                    # print(f"rollout time: {t4-t3:.3f}")
+                    # log all
+                    step_log.update(runner_log)
+                
+                torch.cuda.empty_cache()
+            if use_ddp:
+                dist.barrier()
+
+            # run validation (only rank 0 when RUN_VALIDATION)
+            if (self.epoch % cfg.training.val_every) == 0 and RUN_VALIDATION and _is_main_process():
                 with torch.no_grad():
                     val_losses = list()
                     with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
@@ -280,7 +378,7 @@ class TrainDP3Workspace:
                         # log epoch average validation loss
                         step_log['val_loss'] = val_loss
 
-            # run diffusion sampling on a training batch
+            # run diffusion sampling on a training batch (all ranks for loss; policy is on device)
             if (self.epoch % cfg.training.sample_every) == 0:
                 with torch.no_grad():
                     # sample trajectory from training set, and evaluate difference
@@ -302,36 +400,45 @@ class TrainDP3Workspace:
             if env_runner is None:
                 step_log['test_mean_score'] = - train_loss
                 
-            # checkpoint
+            # checkpoint (only rank 0 saves; all ranks barrier so step_log is in sync)
+            if use_ddp:
+                dist.barrier()
             if (self.epoch % cfg.training.checkpoint_every) == 0 and cfg.checkpoint.save_ckpt:
-                # checkpointing
-                if cfg.checkpoint.save_last_ckpt:
-                    self.save_checkpoint()
-                if cfg.checkpoint.save_last_snapshot:
-                    self.save_snapshot()
+                if _is_main_process():
+                    # checkpointing
+                    if cfg.checkpoint.save_last_ckpt:
+                        self.save_checkpoint()
+                    if cfg.checkpoint.save_last_snapshot:
+                        self.save_snapshot()
 
-                # sanitize metric names
-                metric_dict = dict()
-                for key, value in step_log.items():
-                    new_key = key.replace('/', '_')
-                    metric_dict[new_key] = value
-                
-                # We can't copy the last checkpoint here
-                # since save_checkpoint uses threads.
-                # therefore at this point the file might have been empty!
-                topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                    # sanitize metric names
+                    metric_dict = dict()
+                    for key, value in step_log.items():
+                        new_key = key.replace('/', '_')
+                        metric_dict[new_key] = value
+                    
+                    # We can't copy the last checkpoint here
+                    # since save_checkpoint uses threads.
+                    # therefore at this point the file might have been empty!
+                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
 
-                if topk_ckpt_path is not None:
-                    self.save_checkpoint(path=topk_ckpt_path)
+                    if topk_ckpt_path is not None:
+                        self.save_checkpoint(path=topk_ckpt_path)
+                if use_ddp:
+                    dist.barrier()
             # ========= eval end for this epoch ==========
             policy.train()
 
             # end of epoch
             # log of last step is combined with validation and rollout
-            wandb_run.log(step_log, step=self.global_step)
+            if _is_main_process() and wandb_run is not None:
+                wandb_run.log(step_log, step=self.global_step)
             self.global_step += 1
             self.epoch += 1
             del step_log
+
+        if use_ddp:
+            dist.destroy_process_group()
 
     def eval(self):
         # load the latest checkpoint
@@ -375,6 +482,8 @@ class TrainDP3Workspace:
             exclude_keys=None,
             include_keys=None,
             use_thread=False):
+        if _is_ddp() and not _is_main_process():
+            return None
         if path is None:
             path = pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
         else:
@@ -393,12 +502,13 @@ class TrainDP3Workspace:
 
         for key, value in self.__dict__.items():
             if hasattr(value, 'state_dict') and hasattr(value, 'load_state_dict'):
-                # modules, optimizers and samplers etc
+                # modules, optimizers and samplers etc; save unwrapped state for DDP model/ema_model
                 if key not in exclude_keys:
+                    state = _get_state_dict_for_save(value)
                     if use_thread:
-                        payload['state_dicts'][key] = _copy_to_cpu(value.state_dict())
+                        payload['state_dicts'][key] = _copy_to_cpu(state)
                     else:
-                        payload['state_dicts'][key] = value.state_dict()
+                        payload['state_dicts'][key] = state
             elif key in include_keys:
                 payload['pickles'][key] = dill.dumps(value)
         if use_thread:
@@ -443,7 +553,10 @@ class TrainDP3Workspace:
 
         for key, value in payload['state_dicts'].items():
             if key not in exclude_keys:
-                self.__dict__[key].load_state_dict(value, **kwargs)
+                obj = self.__dict__[key]
+                # load into unwrapped module when DDP so keys match (no "module." prefix in ckpt)
+                target = _get_module_for_load(obj)
+                target.load_state_dict(value, **kwargs)
         for key in include_keys:
             if key in payload['pickles']:
                 self.__dict__[key] = dill.loads(payload['pickles'][key])

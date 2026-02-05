@@ -98,8 +98,9 @@ optimizer:
   weight_decay: 1.0e-6
 
 training:
-  device: "cuda:0"
+  device: "cuda:0"  # ignored when using DDP (torchrun sets device per process)
   seed: 42
+  # DDP is auto-detected when launched with torchrun; no config change needed
   debug: False
   resume: True
   lr_scheduler: cosine

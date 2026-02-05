@@ -1,10 +1,25 @@
 """
 Convert CALVIN dataset to DP3 Zarr format.
 FIXED: Explicitly handles Zarr v3 API 'shape' requirement.
+
+Headless / SLURM: Script sets PYBULLET_MODE=DIRECT and (when DISPLAY is unset)
+PYOPENGL_PLATFORM=osmesa to avoid EGL/display errors. If you still see
+"failed to EGL with glad", run under a virtual display:
+  xvfb-run -a python convert_calvin_to_dp3.py [args...]
 """
 
 import os
 import sys
+
+# --- Headless / SLURM: set before PyBullet or calvin_env touch OpenGL/EGL ---
+os.environ.setdefault("PYBULLET_MODE", "DIRECT")
+# Prefer OSMesa over EGL when no display (avoids "failed to EGL with glad" on SLURM).
+# If OSMesa is not installed or you still get EGL errors, run with a virtual display:
+#   xvfb-run -a python convert_calvin_to_dp3.py ...
+if "DISPLAY" not in os.environ or not os.environ.get("DISPLAY", "").strip():
+    os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
+    os.environ.setdefault("MESA_GL_VERSION_OVERRIDE", "3.3")
+
 import shutil
 import zarr
 import tqdm
@@ -128,31 +143,31 @@ def process_calvin_frame(env, rgb_static, rgb_gripper, depth_static, depth_gripp
     pcd_gripper_img = pcd_gripper_full.T.reshape(h_g, w_g, 3)
     
     # Visualize deprojected point clouds if requested (before cropping)
-    # if visualize:
-    #     # Normalize RGB for visualization if needed
-    #     static_rgb_vis = rgb_static.copy()
-    #     gripper_rgb_vis = rgb_gripper.copy()
-    #     if static_rgb_vis.min() < 0:  # If normalized to [-1, 1]
-    #         static_rgb_vis = (static_rgb_vis + 1) / 2
-    #     if static_rgb_vis.max() > 1.0:
-    #         static_rgb_vis = static_rgb_vis / 255.0
-    #     if gripper_rgb_vis.min() < 0:
-    #         gripper_rgb_vis = (gripper_rgb_vis + 1) / 2
-    #     if gripper_rgb_vis.max() > 1.0:
-    #         gripper_rgb_vis = gripper_rgb_vis / 255.0
+    if visualize:
+        # Normalize RGB for visualization if needed
+        static_rgb_vis = rgb_static.copy()
+        gripper_rgb_vis = rgb_gripper.copy()
+        if static_rgb_vis.min() < 0:  # If normalized to [-1, 1]
+            static_rgb_vis = (static_rgb_vis + 1) / 2
+        if static_rgb_vis.max() > 1.0:
+            static_rgb_vis = static_rgb_vis / 255.0
+        if gripper_rgb_vis.min() < 0:
+            gripper_rgb_vis = (gripper_rgb_vis + 1) / 2
+        if gripper_rgb_vis.max() > 1.0:
+            gripper_rgb_vis = gripper_rgb_vis / 255.0
         
-    #     visualize_point_clouds(
-    #         pcd_static_img,
-    #         pcd_gripper_img,
-    #         static_rgb=static_rgb_vis,
-    #         gripper_rgb=gripper_rgb_vis,
-    #         static_depth=depth_static,
-    #         gripper_depth=depth_gripper,
-    #         frame_idx=frame_idx,
-    #         title="Deprojected Point Clouds",
-    #         save_path=visualize_save_dir,
-    #         stage="before_cropping"
-    #     )
+        visualize_point_clouds(
+            pcd_static_img,
+            pcd_gripper_img,
+            static_rgb=static_rgb_vis,
+            gripper_rgb=gripper_rgb_vis,
+            static_depth=depth_static,
+            gripper_depth=depth_gripper,
+            frame_idx=frame_idx,
+            title="Deprojected Point Clouds",
+            save_path=visualize_save_dir,
+            stage="before_cropping"
+        )
     
     # Crop
     off_y_s = (h_s - 160) // 2
